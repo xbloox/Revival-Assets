@@ -1,0 +1,1707 @@
+local Drawing3D = {}
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Camera = workspace.CurrentCamera
+local Player = Players.LocalPlayer
+local Workspace = workspace
+
+local ObjectPool = {}
+local ActiveObjects = {}
+local RenderQueue = {}
+local DrawingContexts = {}
+local RenderLayers = {}
+local DepthCheckCache = {}
+local DebugSettings = {
+	ShowDebugInfo = false,
+	ShowBoundingBoxes = false,
+	ShowNormals = false,
+	ShowWireframes = false,
+	ShowPerformanceStats = false,
+	DebugTextSize = 14
+}
+local GlobalSettings = {
+	DefaultMode = "Drawing",
+	EnableDepthTesting = true,
+	EnableFrustumCulling = true,
+	MaxDrawDistance = math.huge,
+	AutoCleanup = true,
+	DefaultRenderLayer = "Default",
+	DepthCheckIgnoreList = {},
+	RaycastParams = nil
+}
+
+local function CreateObjectPool()
+	return {
+		Line = {},
+		Circle = {},
+		Square = {},
+		Triangle = {},
+		Quad = {},
+		Text = {},
+		Available = {},
+		InUse = {}
+	}
+end
+
+local function InitializeRenderLayers()
+	RenderLayers = {
+		Background = { Priority = -100, Visible = true, Objects = {} },
+		Default = { Priority = 0, Visible = true, Objects = {} },
+		ESP = { Priority = 50, Visible = true, Objects = {} },
+		UI = { Priority = 100, Visible = true, Objects = {} },
+		Debug = { Priority = 200, Visible = true, Objects = {} }
+	}
+end
+
+local function CreateRaycastParams()
+	if not GlobalSettings.RaycastParams then
+		GlobalSettings.RaycastParams = RaycastParams.new()
+		GlobalSettings.RaycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+		GlobalSettings.RaycastParams.FilterDescendantsInstances = GlobalSettings.DepthCheckIgnoreList
+	end
+	return GlobalSettings.RaycastParams
+end
+
+local function PerformDepthCheck(worldPos, targetObject)
+	local cacheKey = tostring(worldPos) .. "_" .. tostring(targetObject)
+	local currentTime = tick()
+	
+	if DepthCheckCache[cacheKey] and currentTime - DepthCheckCache[cacheKey].Time < 0.1 then
+		return DepthCheckCache[cacheKey].Result
+	end
+	
+	local cameraPos = Camera.CFrame.Position
+	local direction = (worldPos - cameraPos)
+	local distance = direction.Magnitude
+	direction = direction.Unit
+	
+	local raycastParams = CreateRaycastParams()
+	local raycastResult = Workspace:Raycast(cameraPos, direction * distance, raycastParams)
+	
+	local isVisible = true
+	if raycastResult then
+		local hitDistance = (raycastResult.Position - cameraPos).Magnitude
+		if hitDistance < distance - 0.1 then
+			isVisible = false
+		end
+	end
+	
+	DepthCheckCache[cacheKey] = {
+		Result = isVisible,
+		Time = currentTime
+	}
+	
+	return isVisible
+end
+
+local function AddToRenderLayer(object, layerName)
+	layerName = layerName or GlobalSettings.DefaultRenderLayer
+	
+	if not RenderLayers[layerName] then
+		RenderLayers[layerName] = { Priority = 0, Visible = true, Objects = {} }
+	end
+	
+	if object.RenderLayer and RenderLayers[object.RenderLayer] then
+		local oldLayer = RenderLayers[object.RenderLayer].Objects
+		for i, obj in pairs(oldLayer) do
+			if obj == object then
+				table.remove(oldLayer, i)
+				break
+			end
+		end
+	end
+	
+	object.RenderLayer = layerName
+	table.insert(RenderLayers[layerName].Objects, object)
+end
+
+local function RemoveFromRenderLayer(object)
+	if object.RenderLayer and RenderLayers[object.RenderLayer] then
+		local layer = RenderLayers[object.RenderLayer].Objects
+		for i, obj in pairs(layer) do
+			if obj == object then
+				table.remove(layer, i)
+				break
+			end
+		end
+	end
+end
+
+local function GetPooledObject(objectType)
+	local pool = ObjectPool[objectType]
+	if not pool then
+		ObjectPool[objectType] = {}
+		pool = ObjectPool[objectType]
+	end
+	
+	if #pool > 0 then
+		return table.remove(pool)
+	else
+		return Drawing.new(objectType)
+	end
+end
+
+local function ReturnToPool(object, objectType)
+	if object and object.Remove then
+		object.Visible = false
+		local pool = ObjectPool[objectType]
+		if not pool then
+			ObjectPool[objectType] = {}
+			pool = ObjectPool[objectType]
+		end
+		table.insert(pool, object)
+	end
+end
+
+local function WorldToScreenPoint(worldPos)
+	local success, screenPoint, depth = pcall(function()
+		local screenPos, onScreen = Camera:WorldToScreenPoint(worldPos)
+		return screenPos, onScreen, (Camera.CFrame.Position - worldPos).Magnitude
+	end)
+	
+	if success then
+		return Vector2.new(screenPoint.X, screenPoint.Y), screenPoint, depth
+	end
+	return nil, nil, math.huge
+end
+
+local function IsPointOnScreen(screenPos, padding)
+	padding = padding or 0
+	local viewport = Camera.ViewportSize
+	return screenPos.X >= -padding and screenPos.X <= viewport.X + padding and
+	       screenPos.Y >= -padding and screenPos.Y <= viewport.Y + padding
+end
+
+local function ClampToViewport(screenPos, padding)
+	padding = padding or 50
+	local viewport = Camera.ViewportSize
+	return Vector2.new(
+		math.clamp(screenPos.X, padding, viewport.X - padding),
+		math.clamp(screenPos.Y, padding, viewport.Y - padding)
+	)
+end
+
+local function IsPointBehindCamera(worldPos)
+	local cameraCFrame = Camera.CFrame
+	local relativePos = cameraCFrame:PointToObjectSpace(worldPos)
+	return relativePos.Z > 0
+end
+
+local function LineClipping(startWorld, endWorld)
+	local startScreen, startVisible, startDepth = WorldToScreenPoint(startWorld)
+	local endScreen, endVisible, endDepth = WorldToScreenPoint(endWorld)
+	
+	local startBehind = IsPointBehindCamera(startWorld)
+	local endBehind = IsPointBehindCamera(endWorld)
+	
+	if startBehind and endBehind then
+		return nil, nil, false
+	end
+	
+	if startBehind or endBehind then
+		local cameraCFrame = Camera.CFrame
+		local cameraPos = cameraCFrame.Position
+		local cameraLook = cameraCFrame.LookVector
+		
+		local rayDir = (endWorld - startWorld).Unit
+		local toStart = startWorld - cameraPos
+		
+		local denominator = rayDir:Dot(cameraLook)
+		if math.abs(denominator) > 1e-6 then
+			local t = -toStart:Dot(cameraLook) / denominator
+			local intersection = startWorld + rayDir * t
+			
+			if startBehind then
+				startWorld = intersection
+				startScreen, startVisible, startDepth = WorldToScreenPoint(startWorld)
+			else
+				endWorld = intersection
+				endScreen, endVisible, endDepth = WorldToScreenPoint(endWorld)
+			end
+		end
+	end
+	
+	return startScreen, endScreen, true
+end
+
+local function GetViewportBounds()
+	local viewport = Camera.ViewportSize
+	return {
+		Left = 0,
+		Right = viewport.X,
+		Top = 0,
+		Bottom = viewport.Y
+	}
+end
+
+local function ProjectCircleToScreen(center, radius, normal)
+	local centerScreen, centerVisible, depth = WorldToScreenPoint(center)
+	if not centerScreen then return nil end
+	
+	local cameraCFrame = Camera.CFrame
+	local toCamera = (cameraCFrame.Position - center).Unit
+	local dot = normal:Dot(toCamera)
+	
+	local right = normal:Cross(toCamera).Unit
+	local up = right:Cross(normal).Unit
+	
+	local edge1 = center + right * radius
+	local edge2 = center + up * radius
+	
+	local edge1Screen = WorldToScreenPoint(edge1)
+	local edge2Screen = WorldToScreenPoint(edge2)
+	
+	if edge1Screen and edge2Screen then
+		local radiusX = (edge1Screen - centerScreen).Magnitude
+		local radiusY = (edge2Screen - centerScreen).Magnitude
+		return centerScreen, math.max(radiusX, radiusY)
+	end
+	
+	return centerScreen, radius
+end
+
+local DrawingObject = {}
+DrawingObject.__index = DrawingObject
+
+function DrawingObject.New(objectType, mode)
+	local self = setmetatable({}, DrawingObject)
+	self.Type = objectType
+	self.Mode = mode or GlobalSettings.DefaultMode
+	self.Properties = {}
+	self.ZIndex = 0
+	self.AlwaysOnTop = false
+	self.DepthCheck = true
+	self.Visible = true
+	self.Color = Color3.new(1, 1, 1)
+	self.Transparency = 0
+	self.Thickness = 1
+	self.DrawingObject = nil
+	self.LastUpdateTime = 0
+	self.Cached = false
+	self.Id = tostring(self)
+	self.RenderLayer = GlobalSettings.DefaultRenderLayer
+	self.TargetObject = nil
+	self.DebugEnabled = false
+	self.DebugInfo = {}
+	
+	ActiveObjects[self.Id] = self
+	AddToRenderLayer(self, self.RenderLayer)
+	return self
+end
+
+function DrawingObject:SetRenderLayer(layerName)
+	RemoveFromRenderLayer(self)
+	AddToRenderLayer(self, layerName)
+end
+
+function DrawingObject:IsOccluded(worldPos)
+	if not self.DepthCheck then return false end
+	if self.AlwaysOnTop then return false end
+	
+	return not PerformDepthCheck(worldPos, self.TargetObject)
+end
+
+function DrawingObject:SetProperty(name, value)
+	if self.Properties[name] ~= value then
+		self.Properties[name] = value
+		self.Cached = false
+		self.LastUpdateTime = tick()
+	end
+end
+
+function DrawingObject:GetProperty(name)
+	return self.Properties[name]
+end
+
+function DrawingObject:EnableDebug(enabled)
+	self.DebugEnabled = enabled
+end
+
+function DrawingObject:SetDebugInfo(key, value)
+	self.DebugInfo[key] = value
+end
+
+function DrawingObject:Render()
+	if not self.Visible then return end
+	if not RenderLayers[self.RenderLayer] or not RenderLayers[self.RenderLayer].Visible then return end
+	
+	if self.Mode == "Drawing" then
+		self:RenderDrawing()
+	else
+		table.insert(RenderQueue, self)
+	end
+	
+	if self.DebugEnabled and DebugSettings.ShowDebugInfo then
+		self:RenderDebug()
+	end
+end
+
+function DrawingObject:RenderDebug()
+end
+
+function DrawingObject:RenderDrawing()
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject(self.Type)
+	end
+	
+	if self.DrawingObject then
+		self.DrawingObject.Visible = self.Visible
+		self.DrawingObject.Color = self.Color
+		self.DrawingObject.Transparency = self.Transparency
+		local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+		self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+		
+		for property, value in pairs(self.Properties) do
+			pcall(function()
+				self.DrawingObject[property] = value
+			end)
+		end
+	end
+end
+
+function DrawingObject:Update()
+	self.LastUpdateTime = tick()
+	self.Cached = false
+end
+
+function DrawingObject:Destroy()
+	if self.DrawingObject then
+		ReturnToPool(self.DrawingObject, self.Type)
+		self.DrawingObject = nil
+	end
+	RemoveFromRenderLayer(self)
+	ActiveObjects[self.Id] = nil
+end
+
+local Line3D = {}
+Line3D.__index = Line3D
+setmetatable(Line3D, {__index = DrawingObject})
+
+function Line3D.New(startPos, endPos, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Line", config.Mode), Line3D)
+	
+	self.StartPos = startPos
+	self.EndPos = endPos
+	self.PartialClipping = config.PartialClipping ~= false
+	
+	return self
+end
+
+function Line3D:SetPositions(startPos, endPos)
+	self.StartPos = startPos
+	self.EndPos = endPos
+	self:Update()
+end
+
+function Line3D:RenderDrawing()
+	if not self.StartPos or not self.EndPos then return end
+	
+	local midPoint = (self.StartPos + self.EndPos) / 2
+	if self:IsOccluded(midPoint) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local startScreen, endScreen, visible
+	
+	if self.PartialClipping then
+		startScreen, endScreen, visible = LineClipping(self.StartPos, self.EndPos)
+	else
+		startScreen = WorldToScreenPoint(self.StartPos)
+		endScreen = WorldToScreenPoint(self.EndPos)
+		visible = startScreen and endScreen
+	end
+	
+	if not visible or not startScreen or not endScreen then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Line")
+	end
+	
+	self.DrawingObject.From = startScreen
+	self.DrawingObject.To = endScreen
+	self.DrawingObject.Thickness = self.Thickness
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+
+function Line3D:RenderDebug()
+	if DebugSettings.ShowBoundingBoxes then
+		local minPos = Vector3.new(
+			math.min(self.StartPos.X, self.EndPos.X),
+			math.min(self.StartPos.Y, self.EndPos.Y),
+			math.min(self.StartPos.Z, self.EndPos.Z)
+		)
+		local maxPos = Vector3.new(
+			math.max(self.StartPos.X, self.EndPos.X),
+			math.max(self.StartPos.Y, self.EndPos.Y),
+			math.max(self.StartPos.Z, self.EndPos.Z)
+		)
+		local size = maxPos - minPos
+		local center = (minPos + maxPos) / 2
+		
+		local debugBox = Box3D.New(center, size, CFrame.new(), {
+			Mode = "Immediate",
+			RenderLayer = "Debug",
+			Color = Color3.new(1, 1, 0),
+			Transparency = 0.7,
+			Filled = false
+		})
+		debugBox:Render()
+	end
+end
+
+function Line3D:RenderImmediate(context)
+	if not self.StartPos or not self.EndPos then return end
+	
+	local startScreen, endScreen, visible
+	
+	if self.PartialClipping then
+		startScreen, endScreen, visible = LineClipping(self.StartPos, self.EndPos)
+	else
+		startScreen = WorldToScreenPoint(self.StartPos)
+		endScreen = WorldToScreenPoint(self.EndPos)
+		visible = startScreen and endScreen
+	end
+	
+	if visible and startScreen and endScreen then
+		pcall(function()
+			context.Line(startScreen, endScreen, self.Color, 1 - self.Transparency, self.Thickness)
+		end)
+	end
+end
+
+local Text3D = {}
+Text3D.__index = Text3D
+setmetatable(Text3D, {__index = DrawingObject})
+
+function Text3D.New(position, text, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Text", config.Mode), Text3D)
+	
+	self.Position = position
+	self.Text = text or ""
+	self.Size = config.Size or 18
+	self.Font = config.Font or Drawing.Fonts.UI
+	self.Outline = config.Outline or false
+	self.OutlineColor = config.OutlineColor or Color3.new(0, 0, 0)
+	self.Center = config.Center or false
+	self.Billboard = config.Billboard ~= false
+	
+	return self
+end
+
+function Text3D:RenderDrawing()
+	if not self.Position or not self.Text or self.Text == "" then return end
+	
+	if self:IsOccluded(self.Position) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local screenPos = WorldToScreenPoint(self.Position)
+	if not screenPos or not IsPointOnScreen(screenPos) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Text")
+	end
+	
+	self.DrawingObject.Position = screenPos
+	self.DrawingObject.Text = self.Text
+	self.DrawingObject.Size = self.Size
+	self.DrawingObject.Font = self.Font
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	self.DrawingObject.Outline = self.Outline
+	self.DrawingObject.OutlineColor = self.OutlineColor
+	self.DrawingObject.Center = self.Center
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+
+function Text3D:RenderImmediate(context)
+	if not self.Position or not self.Text or self.Text == "" then return end
+	
+	if self:IsOccluded(self.Position) then return end
+	
+	local screenPos = WorldToScreenPoint(self.Position)
+	if not screenPos or not IsPointOnScreen(screenPos) then return end
+	
+	pcall(function()
+		if self.Outline then
+			context.OutlinedText(screenPos, self.Font, self.Size, self.Color, 1 - self.Transparency, 
+				self.OutlineColor, 1 - self.Transparency, self.Text, self.Center)
+		else
+			context.Text(screenPos, self.Font, self.Size, self.Color, 1 - self.Transparency, self.Text, self.Center)
+		end
+	end)
+end
+
+local Image3D = {}
+Image3D.__index = Image3D
+setmetatable(Image3D, {__index = DrawingObject})
+
+function Image3D.New(position, size, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Square", config.Mode), Image3D)
+	
+	self.Position = position
+	self.Size = size or Vector2.new(100, 100)
+	self.Data = config.Data or ""
+	self.Rounding = config.Rounding or 0
+	self.Billboard = config.Billboard ~= false
+	
+	return self
+end
+
+function Image3D:RenderDrawing()
+	if not self.Position then return end
+	
+	if self:IsOccluded(self.Position) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local screenPos = WorldToScreenPoint(self.Position)
+	if not screenPos or not IsPointOnScreen(screenPos) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Square")
+		if self.Data and self.Data ~= "" then
+			pcall(function()
+				self.DrawingObject.Data = self.Data
+			end)
+		end
+	end
+	
+	local adjustedSize = self.Size
+	if self.Billboard then
+		local distance = (Camera.CFrame.Position - self.Position).Magnitude
+		local scaleFactor = math.max(0.1, 1 / (distance * 0.01))
+		adjustedSize = self.Size * scaleFactor
+	end
+	
+	self.DrawingObject.Position = screenPos - adjustedSize / 2
+	self.DrawingObject.Size = adjustedSize
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	self.DrawingObject.Rounding = self.Rounding
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+Circle3D.__index = Circle3D
+setmetatable(Circle3D, {__index = DrawingObject})
+
+local Circle3D = {}
+Circle3D.__index = Circle3D
+setmetatable(Circle3D, {__index = DrawingObject})
+
+function Circle3D.New(center, radius, normal, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Circle", config.Mode), Circle3D)
+	
+	self.Center = center
+	self.Radius = radius
+	self.Normal = normal or Vector3.new(0, 1, 0)
+	self.Filled = config.Filled or false
+	self.NumSides = config.NumSides or 64
+	
+	return self
+end
+
+function Circle3D:RenderDrawing()
+	if not self.Center then return end
+	
+	if self:IsOccluded(self.Center) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local centerScreen, projectedRadius = ProjectCircleToScreen(self.Center, self.Radius, self.Normal)
+	if not centerScreen then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not IsPointOnScreen(centerScreen, projectedRadius) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Circle")
+	end
+	
+	self.DrawingObject.Position = centerScreen
+	self.DrawingObject.Radius = projectedRadius
+	self.DrawingObject.Filled = self.Filled
+	self.DrawingObject.NumSides = self.NumSides
+	self.DrawingObject.Thickness = self.Thickness
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+
+function Circle3D:RenderImmediate(context)
+	if not self.Center then return end
+	
+	if self:IsOccluded(self.Center) then return end
+	
+	local centerScreen, projectedRadius = ProjectCircleToScreen(self.Center, self.Radius, self.Normal)
+	if not centerScreen or not IsPointOnScreen(centerScreen, projectedRadius) then return end
+	
+	pcall(function()
+		if self.Filled then
+			context.FilledCircle(centerScreen, projectedRadius, self.Color, self.NumSides, 1 - self.Transparency)
+		else
+			context.Circle(centerScreen, projectedRadius, self.Color, 1 - self.Transparency, self.NumSides, self.Thickness)
+		end
+	end)
+end
+
+function Circle3D:RenderDebug()
+	if DebugSettings.ShowNormals then
+		local normalArrow = Debug3D.DrawNormal(self.Center, self.Normal, self.Radius * 0.5, {
+			Mode = "Immediate",
+			Color = Color3.new(0, 1, 1)
+		})
+		if normalArrow then
+			normalArrow:Render()
+		end
+	end
+	
+	if DebugSettings.ShowBoundingBoxes then
+		local boundingBox = Debug3D.DrawBoundingSphere(self)
+		if boundingBox then
+			boundingBox:Render()
+		end
+	end
+end
+
+local Triangle3D = {}
+Triangle3D.__index = Triangle3D
+setmetatable(Triangle3D, {__index = DrawingObject})
+
+function Triangle3D.New(pointA, pointB, pointC, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Triangle", config.Mode), Triangle3D)
+	
+	self.PointA = pointA
+	self.PointB = pointB
+	self.PointC = pointC
+	self.Filled = config.Filled or false
+	
+	return self
+end
+
+function Triangle3D:RenderDrawing()
+	if not self.PointA or not self.PointB or not self.PointC then return end
+	
+	local center = (self.PointA + self.PointB + self.PointC) / 3
+	if self:IsOccluded(center) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local screenA = WorldToScreenPoint(self.PointA)
+	local screenB = WorldToScreenPoint(self.PointB)
+	local screenC = WorldToScreenPoint(self.PointC)
+	
+	if not screenA or not screenB or not screenC then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Triangle")
+	end
+	
+	self.DrawingObject.PointA = screenA
+	self.DrawingObject.PointB = screenB
+	self.DrawingObject.PointC = screenC
+	self.DrawingObject.Filled = self.Filled
+	self.DrawingObject.Thickness = self.Thickness
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+
+function Triangle3D:RenderImmediate(context)
+	if not self.PointA or not self.PointB or not self.PointC then return end
+	
+	local center = (self.PointA + self.PointB + self.PointC) / 3
+	if self:IsOccluded(center) then return end
+	
+	local screenA = WorldToScreenPoint(self.PointA)
+	local screenB = WorldToScreenPoint(self.PointB)
+	local screenC = WorldToScreenPoint(self.PointC)
+	
+	if not screenA or not screenB or not screenC then return end
+	
+	pcall(function()
+		if self.Filled then
+			context.FilledTriangle(screenA, screenB, screenC, self.Color, 1 - self.Transparency)
+		else
+			context.Triangle(screenA, screenB, screenC, self.Color, 1 - self.Transparency, self.Thickness)
+		end
+	end)
+end
+
+function Triangle3D:RenderDebug()
+	if DebugSettings.ShowNormals then
+		local center = (self.PointA + self.PointB + self.PointC) / 3
+		local edge1 = self.PointB - self.PointA
+		local edge2 = self.PointC - self.PointA
+		local normal = edge1:Cross(edge2).Unit
+		
+		local normalArrow = Debug3D.DrawNormal(center, normal, 3, {
+			Mode = "Immediate",
+			Color = Color3.new(1, 0, 1)
+		})
+		if normalArrow then
+			normalArrow:Render()
+		end
+	end
+end
+
+local Quad3D = {}
+Quad3D.__index = Quad3D
+setmetatable(Quad3D, {__index = DrawingObject})
+
+function Quad3D.New(pointA, pointB, pointC, pointD, config)
+	config = config or {}
+	local self = setmetatable(DrawingObject.New("Quad", config.Mode), Quad3D)
+	
+	self.PointA = pointA
+	self.PointB = pointB
+	self.PointC = pointC
+	self.PointD = pointD
+	self.Filled = config.Filled or false
+	
+	return self
+end
+
+function Quad3D:RenderDrawing()
+	if not self.PointA or not self.PointB or not self.PointC or not self.PointD then return end
+	
+	local center = (self.PointA + self.PointB + self.PointC + self.PointD) / 4
+	if self:IsOccluded(center) then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	local screenA = WorldToScreenPoint(self.PointA)
+	local screenB = WorldToScreenPoint(self.PointB)
+	local screenC = WorldToScreenPoint(self.PointC)
+	local screenD = WorldToScreenPoint(self.PointD)
+	
+	if not screenA or not screenB or not screenC or not screenD then
+		if self.DrawingObject then
+			self.DrawingObject.Visible = false
+		end
+		return
+	end
+	
+	if not self.DrawingObject then
+		self.DrawingObject = GetPooledObject("Quad")
+	end
+	
+	self.DrawingObject.PointA = screenA
+	self.DrawingObject.PointB = screenB
+	self.DrawingObject.PointC = screenC
+	self.DrawingObject.PointD = screenD
+	self.DrawingObject.Filled = self.Filled
+	self.DrawingObject.Thickness = self.Thickness
+	self.DrawingObject.Color = self.Color
+	self.DrawingObject.Transparency = self.Transparency
+	local layerPriority = RenderLayers[self.RenderLayer] and RenderLayers[self.RenderLayer].Priority or 0
+	self.DrawingObject.ZIndex = self.ZIndex + layerPriority + (self.AlwaysOnTop and 1000 or 0)
+	self.DrawingObject.Visible = self.Visible
+end
+
+function Quad3D:RenderImmediate(context)
+	if not self.PointA or not self.PointB or not self.PointC or not self.PointD then return end
+	
+	local center = (self.PointA + self.PointB + self.PointC + self.PointD) / 4
+	if self:IsOccluded(center) then return end
+	
+	local screenA = WorldToScreenPoint(self.PointA)
+	local screenB = WorldToScreenPoint(self.PointB)
+	local screenC = WorldToScreenPoint(self.PointC)
+	local screenD = WorldToScreenPoint(self.PointD)
+	
+	if not screenA or not screenB or not screenC or not screenD then return end
+	
+	pcall(function()
+		if self.Filled then
+			context.FilledQuad(screenA, screenB, screenC, screenD, self.Color, 1 - self.Transparency)
+		else
+			context.Quad(screenA, screenB, screenC, screenD, self.Color, 1 - self.Transparency, self.Thickness)
+		end
+	end)
+end
+
+function Quad3D:RenderDebug()
+	if DebugSettings.ShowNormals then
+		local center = (self.PointA + self.PointB + self.PointC + self.PointD) / 4
+		local edge1 = self.PointB - self.PointA
+		local edge2 = self.PointD - self.PointA
+		local normal = edge1:Cross(edge2).Unit
+		
+		local normalArrow = Debug3D.DrawNormal(center, normal, 3, {
+			Mode = "Immediate",
+			Color = Color3.new(1, 0, 1)
+		})
+		if normalArrow then
+			normalArrow:Render()
+		end
+	end
+end
+
+local Box3D = {}
+Box3D.__index = Box3D
+setmetatable(Box3D, {__index = DrawingObject})
+
+function Box3D.New(center, size, orientation, config)
+	config = config or {}
+	local self = setmetatable({}, Box3D)
+	
+	self.Center = center
+	self.Size = size
+	self.Orientation = orientation or CFrame.new()
+	self.Filled = config.Filled or false
+	self.Mode = config.Mode or GlobalSettings.DefaultMode
+	self.Lines = {}
+	self.Faces = {}
+	
+	self.ZIndex = config.ZIndex or 0
+	self.AlwaysOnTop = config.AlwaysOnTop or false
+	self.DepthCheck = config.DepthCheck ~= false
+	self.Visible = config.Visible ~= false
+	self.Color = config.Color or Color3.new(1, 1, 1)
+	self.Transparency = config.Transparency or 0
+	self.Thickness = config.Thickness or 1
+	
+	self:CalculateVertices()
+	return self
+end
+
+function Box3D:CalculateVertices()
+	local cf = CFrame.new(self.Center) * self.Orientation
+	local s = self.Size / 2
+	
+	self.Vertices = {
+		cf * Vector3.new(-s.X, -s.Y, -s.Z),
+		cf * Vector3.new(s.X, -s.Y, -s.Z),
+		cf * Vector3.new(s.X, s.Y, -s.Z),
+		cf * Vector3.new(-s.X, s.Y, -s.Z),
+		cf * Vector3.new(-s.X, -s.Y, s.Z),
+		cf * Vector3.new(s.X, -s.Y, s.Z),
+		cf * Vector3.new(s.X, s.Y, s.Z),
+		cf * Vector3.new(-s.X, s.Y, s.Z)
+	}
+end
+
+function Box3D:CreateLines()
+	if #self.Lines == 0 then
+		local edges = {
+			{1, 2}, {2, 3}, {3, 4}, {4, 1},
+			{5, 6}, {6, 7}, {7, 8}, {8, 5},
+			{1, 5}, {2, 6}, {3, 7}, {4, 8}
+		}
+		
+		for _, edge in pairs(edges) do
+			local line = Line3D.New(self.Vertices[edge[1]], self.Vertices[edge[2]], {
+				Mode = self.Mode,
+				PartialClipping = false
+			})
+			line.Color = self.Color
+			line.Transparency = self.Transparency
+			line.Thickness = self.Thickness
+			line.ZIndex = self.ZIndex
+			line.AlwaysOnTop = self.AlwaysOnTop
+			table.insert(self.Lines, line)
+		end
+	end
+end
+
+function Box3D:CreateFaces()
+	if #self.Faces == 0 and self.Filled then
+		local faces = {
+			{1, 2, 3, 4},
+			{5, 6, 7, 8},
+			{1, 2, 6, 5},
+			{3, 4, 8, 7},
+			{1, 4, 8, 5},
+			{2, 3, 7, 6}
+		}
+		
+		for _, face in pairs(faces) do
+			local quad = Quad3D.New(
+				self.Vertices[face[1]], self.Vertices[face[2]], 
+				self.Vertices[face[3]], self.Vertices[face[4]], 
+				{
+					Mode = self.Mode,
+					Filled = true
+				}
+			)
+			quad.Color = self.Color
+			quad.Transparency = self.Transparency
+			quad.ZIndex = self.ZIndex
+			quad.AlwaysOnTop = self.AlwaysOnTop
+			table.insert(self.Faces, quad)
+		end
+	end
+end
+
+function Box3D:Update()
+	self:CalculateVertices()
+	
+	for i, line in pairs(self.Lines) do
+		local edge = {{1, 2}, {2, 3}, {3, 4}, {4, 1}, {5, 6}, {6, 7}, {7, 8}, {8, 5}, {1, 5}, {2, 6}, {3, 7}, {4, 8}}[i]
+		if edge then
+			line:SetPositions(self.Vertices[edge[1]], self.Vertices[edge[2]])
+		end
+	end
+	
+	for i, face in pairs(self.Faces) do
+		local faceIndices = {{1, 2, 3, 4}, {5, 6, 7, 8}, {1, 2, 6, 5}, {3, 4, 8, 7}, {1, 4, 8, 5}, {2, 3, 7, 6}}[i]
+		if faceIndices then
+			face.PointA = self.Vertices[faceIndices[1]]
+			face.PointB = self.Vertices[faceIndices[2]]
+			face.PointC = self.Vertices[faceIndices[3]]
+			face.PointD = self.Vertices[faceIndices[4]]
+		end
+	end
+end
+
+function Box3D:Render()
+	if not self.Visible then return end
+	
+	self:CreateLines()
+	if self.Filled then
+		self:CreateFaces()
+	end
+	
+	for _, line in pairs(self.Lines) do
+		line:Render()
+	end
+	
+	for _, face in pairs(self.Faces) do
+		face:Render()
+	end
+end
+
+function Box3D:Destroy()
+	for _, line in pairs(self.Lines) do
+		line:Destroy()
+	end
+	for _, face in pairs(self.Faces) do
+		face:Destroy()
+	end
+	self.Lines = {}
+	self.Faces = {}
+end
+
+local Sphere3D = {}
+Sphere3D.__index = Sphere3D
+setmetatable(Sphere3D, {__index = DrawingObject})
+
+function Sphere3D.New(center, radius, config)
+	config = config or {}
+	local self = setmetatable({}, Sphere3D)
+	
+	self.Center = center
+	self.Radius = radius
+	self.Segments = config.Segments or 16
+	self.Rings = config.Rings or 8
+	self.Filled = config.Filled or false
+	self.Mode = config.Mode or GlobalSettings.DefaultMode
+	self.Lines = {}
+	
+	self.ZIndex = config.ZIndex or 0
+	self.AlwaysOnTop = config.AlwaysOnTop or false
+	self.DepthCheck = config.DepthCheck ~= false
+	self.Visible = config.Visible ~= false
+	self.Color = config.Color or Color3.new(1, 1, 1)
+	self.Transparency = config.Transparency or 0
+	self.Thickness = config.Thickness or 1
+	
+	self:CreateWireframe()
+	return self
+end
+
+function Sphere3D:CreateWireframe()
+	self.Lines = {}
+	
+	for ring = 0, self.Rings - 1 do
+		local phi = math.pi * ring / self.Rings
+		local y = self.Radius * math.cos(phi)
+		local ringRadius = self.Radius * math.sin(phi)
+		
+		for segment = 0, self.Segments - 1 do
+			local theta1 = 2 * math.pi * segment / self.Segments
+			local theta2 = 2 * math.pi * (segment + 1) / self.Segments
+			
+			local x1 = ringRadius * math.cos(theta1)
+			local z1 = ringRadius * math.sin(theta1)
+			local x2 = ringRadius * math.cos(theta2)
+			local z2 = ringRadius * math.sin(theta2)
+			
+			local point1 = self.Center + Vector3.new(x1, y, z1)
+			local point2 = self.Center + Vector3.new(x2, y, z2)
+			
+			local line = Line3D.New(point1, point2, {Mode = self.Mode})
+			line.Color = self.Color
+			line.Transparency = self.Transparency
+			line.Thickness = self.Thickness
+			line.ZIndex = self.ZIndex
+			line.AlwaysOnTop = self.AlwaysOnTop
+			table.insert(self.Lines, line)
+		end
+	end
+	
+	for segment = 0, self.Segments - 1 do
+		local theta = 2 * math.pi * segment / self.Segments
+		
+		for ring = 0, self.Rings - 1 do
+			local phi1 = math.pi * ring / self.Rings
+			local phi2 = math.pi * (ring + 1) / self.Rings
+			
+			local y1 = self.Radius * math.cos(phi1)
+			local y2 = self.Radius * math.cos(phi2)
+			local ringRadius1 = self.Radius * math.sin(phi1)
+			local ringRadius2 = self.Radius * math.sin(phi2)
+			
+			local x1 = ringRadius1 * math.cos(theta)
+			local z1 = ringRadius1 * math.sin(theta)
+			local x2 = ringRadius2 * math.cos(theta)
+			local z2 = ringRadius2 * math.sin(theta)
+			
+			local point1 = self.Center + Vector3.new(x1, y1, z1)
+			local point2 = self.Center + Vector3.new(x2, y2, z2)
+			
+			local line = Line3D.New(point1, point2, {Mode = self.Mode})
+			line.Color = self.Color
+			line.Transparency = self.Transparency
+			line.Thickness = self.Thickness
+			line.ZIndex = self.ZIndex
+			line.AlwaysOnTop = self.AlwaysOnTop
+			table.insert(self.Lines, line)
+		end
+	end
+end
+
+function Sphere3D:Render()
+	if not self.Visible then return end
+	
+	for _, line in pairs(self.Lines) do
+		line:Render()
+	end
+end
+
+function Sphere3D:Destroy()
+	for _, line in pairs(self.Lines) do
+		line:Destroy()
+	end
+	self.Lines = {}
+end
+
+local Arrow3D = {}
+Arrow3D.__index = Arrow3D
+setmetatable(Arrow3D, {__index = DrawingObject})
+
+function Arrow3D.New(fromPos, toPos, config)
+	config = config or {}
+	local self = setmetatable({}, Arrow3D)
+	
+	self.FromPos = fromPos
+	self.ToPos = toPos
+	self.HeadSize = config.HeadSize or 0.5
+	self.HeadAngle = config.HeadAngle or math.rad(30)
+	self.Mode = config.Mode or GlobalSettings.DefaultMode
+	
+	self.ZIndex = config.ZIndex or 0
+	self.AlwaysOnTop = config.AlwaysOnTop or false
+	self.DepthCheck = config.DepthCheck ~= false
+	self.Visible = config.Visible ~= false
+	self.Color = config.Color or Color3.new(1, 1, 1)
+	self.Transparency = config.Transparency or 0
+	self.Thickness = config.Thickness or 1
+	
+	self.Shaft = nil
+	self.Head1 = nil
+	self.Head2 = nil
+	
+	self:CreateArrow()
+	return self
+end
+
+function Arrow3D:CreateArrow()
+	local direction = (self.ToPos - self.FromPos).Unit
+	local length = (self.ToPos - self.FromPos).Magnitude
+	
+	self.Shaft = Line3D.New(self.FromPos, self.ToPos, {Mode = self.Mode})
+	self.Shaft.Color = self.Color
+	self.Shaft.Transparency = self.Transparency
+	self.Shaft.Thickness = self.Thickness
+	self.Shaft.ZIndex = self.ZIndex
+	self.Shaft.AlwaysOnTop = self.AlwaysOnTop
+	
+	local headLength = math.min(self.HeadSize, length * 0.3)
+	local headStart = self.ToPos - direction * headLength
+	
+	local perpendicular1 = Vector3.new(-direction.Z, 0, direction.X).Unit
+	if perpendicular1.Magnitude == 0 then
+		perpendicular1 = Vector3.new(1, 0, 0)
+	end
+	local perpendicular2 = direction:Cross(perpendicular1)
+	
+	local headOffset = headLength * math.tan(self.HeadAngle)
+	local headPoint1 = headStart + perpendicular1 * headOffset
+	local headPoint2 = headStart + perpendicular2 * headOffset
+	
+	self.Head1 = Line3D.New(self.ToPos, headPoint1, {Mode = self.Mode})
+	self.Head1.Color = self.Color
+	self.Head1.Transparency = self.Transparency
+	self.Head1.Thickness = self.Thickness
+	self.Head1.ZIndex = self.ZIndex
+	self.Head1.AlwaysOnTop = self.AlwaysOnTop
+	
+	self.Head2 = Line3D.New(self.ToPos, headPoint2, {Mode = self.Mode})
+	self.Head2.Color = self.Color
+	self.Head2.Transparency = self.Transparency
+	self.Head2.Thickness = self.Thickness
+	self.Head2.ZIndex = self.ZIndex
+	self.Head2.AlwaysOnTop = self.AlwaysOnTop
+end
+
+function Arrow3D:Render()
+	if not self.Visible then return end
+	
+	if self.Shaft then self.Shaft:Render() end
+	if self.Head1 then self.Head1:Render() end
+	if self.Head2 then self.Head2:Render() end
+end
+
+function Arrow3D:Destroy()
+	if self.Shaft then self.Shaft:Destroy() end
+	if self.Head1 then self.Head1:Destroy() end
+	if self.Head2 then self.Head2:Destroy() end
+end
+
+local Capsule3D = {}
+Capsule3D.__index = Capsule3D
+setmetatable(Capsule3D, {__index = DrawingObject})
+
+function Capsule3D.New(startPos, endPos, radius, config)
+	config = config or {}
+	local self = setmetatable({}, Capsule3D)
+	
+	self.StartPos = startPos
+	self.EndPos = endPos
+	self.Radius = radius
+	self.Segments = config.Segments or 12
+	self.Mode = config.Mode or GlobalSettings.DefaultMode
+	self.Lines = {}
+	
+	self.ZIndex = config.ZIndex or 0
+	self.AlwaysOnTop = config.AlwaysOnTop or false
+	self.DepthCheck = config.DepthCheck ~= false
+	self.Visible = config.Visible ~= false
+	self.Color = config.Color or Color3.new(1, 1, 1)
+	self.Transparency = config.Transparency or 0
+	self.Thickness = config.Thickness or 1
+	
+	self:CreateCapsule()
+	return self
+end
+
+function Capsule3D:CreateCapsule()
+	self.Lines = {}
+	
+	local direction = (self.EndPos - self.StartPos).Unit
+	local length = (self.StartPos - self.EndPos).Magnitude
+	
+	local right = Vector3.new(-direction.Z, 0, direction.X).Unit
+	if right.Magnitude == 0 then
+		right = Vector3.new(1, 0, 0)
+	end
+	local up = direction:Cross(right)
+	
+	for i = 0, self.Segments - 1 do
+		local angle = 2 * math.pi * i / self.Segments
+		local nextAngle = 2 * math.pi * (i + 1) / self.Segments
+		
+		local offset1 = right * math.cos(angle) * self.Radius + up * math.sin(angle) * self.Radius
+		local offset2 = right * math.cos(nextAngle) * self.Radius + up * math.sin(nextAngle) * self.Radius
+		
+		local startPoint1 = self.StartPos + offset1
+		local endPoint1 = self.EndPos + offset1
+		local startPoint2 = self.StartPos + offset2
+		local endPoint2 = self.EndPos + offset2
+		
+		local cylinderLine = Line3D.New(startPoint1, endPoint1, {Mode = self.Mode})
+		cylinderLine.Color = self.Color
+		cylinderLine.Transparency = self.Transparency
+		cylinderLine.Thickness = self.Thickness
+		cylinderLine.ZIndex = self.ZIndex
+		cylinderLine.AlwaysOnTop = self.AlwaysOnTop
+		table.insert(self.Lines, cylinderLine)
+		
+		local ringLine1 = Line3D.New(startPoint1, startPoint2, {Mode = self.Mode})
+		ringLine1.Color = self.Color
+		ringLine1.Transparency = self.Transparency
+		ringLine1.Thickness = self.Thickness
+		ringLine1.ZIndex = self.ZIndex
+		ringLine1.AlwaysOnTop = self.AlwaysOnTop
+		table.insert(self.Lines, ringLine1)
+		
+		local ringLine2 = Line3D.New(endPoint1, endPoint2, {Mode = self.Mode})
+		ringLine2.Color = self.Color
+		ringLine2.Transparency = self.Transparency
+		ringLine2.Thickness = self.Thickness
+		ringLine2.ZIndex = self.ZIndex
+		ringLine2.AlwaysOnTop = self.AlwaysOnTop
+		table.insert(self.Lines, ringLine2)
+	end
+end
+
+function Capsule3D:Render()
+	if not self.Visible then return end
+	
+	for _, line in pairs(self.Lines) do
+		line:Render()
+	end
+end
+
+function Capsule3D:Destroy()
+	for _, line in pairs(self.Lines) do
+		line:Destroy()
+	end
+	self.Lines = {}
+end
+
+local ESP3D = {}
+
+function ESP3D.DrawBoundingBox3D(object, config)
+	config = config or {}
+	
+	if not object or not object.Parent then return nil end
+	
+	local cf, size
+	if object:IsA("Model") then
+		cf, size = object:GetBoundingBox()
+	elseif object:IsA("BasePart") then
+		cf = object.CFrame
+		size = object.Size
+	else
+		return nil
+	end
+	
+	return Box3D.New(cf.Position, size, cf - cf.Position, config)
+end
+
+function ESP3D.DrawESP3D(part, config)
+	config = config or {}
+	config.Mode = config.Mode or "Drawing"
+	
+	if not part or not part.Parent then return nil end
+	
+	local espType = config.Type or "Box"
+	
+	if espType == "Box" then
+		return ESP3D.DrawBoundingBox3D(part, config)
+	elseif espType == "Circle" then
+		local circle = Circle3D.New(part.Position, config.Radius or 5, Vector3.new(0, 1, 0), config)
+		return circle
+	elseif espType == "Tracer" then
+		local startPos = config.StartPos or Camera.CFrame.Position
+		local line = Line3D.New(startPos, part.Position, config)
+		return line
+	end
+	
+	return nil
+end
+
+local Grid3D = {}
+
+function Grid3D.DrawDebugAxes(origin, size, config)
+	config = config or {}
+	origin = origin or Vector3.new(0, 0, 0)
+	size = size or 10
+	
+	local axes = {}
+	
+	local xAxis = Line3D.New(origin, origin + Vector3.new(size, 0, 0), config)
+	xAxis.Color = Color3.new(1, 0, 0)
+	table.insert(axes, xAxis)
+	
+	local yAxis = Line3D.New(origin, origin + Vector3.new(0, size, 0), config)
+	yAxis.Color = Color3.new(0, 1, 0)
+	table.insert(axes, yAxis)
+	
+	local zAxis = Line3D.New(origin, origin + Vector3.new(0, 0, size), config)
+	zAxis.Color = Color3.new(0, 0, 1)
+	table.insert(axes, zAxis)
+	
+	return axes
+end
+
+function Grid3D.Draw3DGrid(center, size, spacing, config)
+	config = config or {}
+	local lines = {}
+	
+	local halfSize = size / 2
+	local steps = math.floor(size / spacing)
+	
+	for i = -steps, steps do
+		local offset = i * spacing
+		
+		local lineX1 = Line3D.New(
+			center + Vector3.new(-halfSize, 0, offset),
+			center + Vector3.new(halfSize, 0, offset),
+			config
+		)
+		local lineX2 = Line3D.New(
+			center + Vector3.new(offset, 0, -halfSize),
+			center + Vector3.new(offset, 0, halfSize),
+			config
+		)
+		
+		table.insert(lines, lineX1)
+		table.insert(lines, lineX2)
+	end
+	
+	return lines
+end
+
+local RenderManager = {}
+
+function RenderManager.SetupImmediateContext()
+	for zIndex = -200, 200 do
+		if not DrawingContexts[zIndex] then
+			DrawingContexts[zIndex] = DrawingImmediate.GetPaint(zIndex)
+			DrawingContexts[zIndex]:Connect(function(context)
+				for layerName, layer in pairs(RenderLayers) do
+					if layer.Visible then
+						for _, obj in pairs(layer.Objects) do
+							if obj.ZIndex + layer.Priority == zIndex and obj.Mode == "Immediate" and obj.Visible then
+								if obj.RenderImmediate then
+									obj:RenderImmediate(context)
+								end
+							end
+						end
+					end
+				end
+				
+				for _, obj in pairs(RenderQueue) do
+					if obj.ZIndex == zIndex and obj.Mode == "Immediate" then
+						if obj.RenderImmediate then
+							obj:RenderImmediate(context)
+						end
+					end
+				end
+			end)
+		end
+	end
+end
+
+function RenderManager.Update()
+	RenderQueue = {}
+	
+	local sortedLayers = {}
+	for name, layer in pairs(RenderLayers) do
+		table.insert(sortedLayers, {Name = name, Layer = layer})
+	end
+	table.sort(sortedLayers, function(a, b) return a.Layer.Priority < b.Layer.Priority end)
+	
+	for _, layerData in pairs(sortedLayers) do
+		local layer = layerData.Layer
+		if layer.Visible then
+			for _, obj in pairs(layer.Objects) do
+				if obj.Render then
+					obj:Render()
+				end
+			end
+		end
+	end
+	
+	for _, obj in pairs(ActiveObjects) do
+		if not obj.RenderLayer or not RenderLayers[obj.RenderLayer] then
+			if obj.Render then
+				obj:Render()
+			end
+		end
+	end
+	
+	if DebugSettings.ShowPerformanceStats then
+		local perfStats = Debug3D.DrawPerformanceStats(Camera.CFrame.Position + Camera.CFrame.LookVector * 10)
+		for _, stat in pairs(perfStats) do
+			stat:Render()
+		end
+	end
+	
+	if tick() % 5 < 0.1 then
+		for key, cache in pairs(DepthCheckCache) do
+			if tick() - cache.Time > 1 then
+				DepthCheckCache[key] = nil
+			end
+		end
+	end
+end
+
+local function RotatePointAroundAxis(point, origin, axis, angle)
+	local relative = point - origin
+	local cosAngle = math.cos(angle)
+	local sinAngle = math.sin(angle)
+	local oneMinusCos = 1 - cosAngle
+	
+	local x, y, z = relative.X, relative.Y, relative.Z
+	local ux, uy, uz = axis.X, axis.Y, axis.Z
+	
+	local rotatedX = (cosAngle + ux * ux * oneMinusCos) * x +
+	                 (ux * uy * oneMinusCos - uz * sinAngle) * y +
+	                 (ux * uz * oneMinusCos + uy * sinAngle) * z
+	
+	local rotatedY = (uy * ux * oneMinusCos + uz * sinAngle) * x +
+	                 (cosAngle + uy * uy * oneMinusCos) * y +
+	                 (uy * uz * oneMinusCos - ux * sinAngle) * z
+	
+	local rotatedZ = (uz * ux * oneMinusCos - uy * sinAngle) * x +
+	                 (uz * uy * oneMinusCos + ux * sinAngle) * y +
+	                 (cosAngle + uz * uz * oneMinusCos) * z
+	
+	return origin + Vector3.new(rotatedX, rotatedY, rotatedZ)
+end
+
+InitializeRenderLayers()
+RenderManager.SetupImmediateContext()
+
+local renderConnection = RunService.Heartbeat:Connect(function()
+	RenderManager.Update()
+end)
+
+Drawing3D.Line3D = Line3D
+Drawing3D.Circle3D = Circle3D
+Drawing3D.Triangle3D = Triangle3D
+Drawing3D.Quad3D = Quad3D
+Drawing3D.Box3D = Box3D
+Drawing3D.Sphere3D = Sphere3D
+Drawing3D.Arrow3D = Arrow3D
+Drawing3D.Capsule3D = Capsule3D
+Drawing3D.Text3D = Text3D
+Drawing3D.Image3D = Image3D
+Drawing3D.ESP3D = ESP3D
+Drawing3D.Grid3D = Grid3D
+Drawing3D.Debug3D = Debug3D
+
+Drawing3D.WorldToScreenPoint = WorldToScreenPoint
+Drawing3D.IsPointOnScreen = IsPointOnScreen
+Drawing3D.ClampToViewport = ClampToViewport
+Drawing3D.RotatePointAroundAxis = RotatePointAroundAxis
+
+Drawing3D.SetGlobalSettings = function(settings)
+	for key, value in pairs(settings) do
+		GlobalSettings[key] = value
+	end
+	if settings.DepthCheckIgnoreList then
+		CreateRaycastParams()
+	end
+end
+
+Drawing3D.GetGlobalSettings = function()
+	return GlobalSettings
+end
+
+Drawing3D.SetDebugSettings = function(settings)
+	for key, value in pairs(settings) do
+		DebugSettings[key] = value
+	end
+end
+
+Drawing3D.GetDebugSettings = function()
+	return DebugSettings
+end
+
+Drawing3D.CreateRenderLayer = function(name, priority, visible)
+	priority = priority or 0
+	visible = visible ~= false
+	
+	RenderLayers[name] = {
+		Priority = priority,
+		Visible = visible,
+		Objects = {}
+	}
+	
+	return RenderLayers[name]
+end
+
+Drawing3D.SetLayerVisibility = function(layerName, visible)
+	if RenderLayers[layerName] then
+		RenderLayers[layerName].Visible = visible
+	end
+end
+
+Drawing3D.SetLayerPriority = function(layerName, priority)
+	if RenderLayers[layerName] then
+		RenderLayers[layerName].Priority = priority
+	end
+end
+
+Drawing3D.GetRenderLayers = function()
+	return RenderLayers
+end
+
+Drawing3D.Clear = function()
+	for _, obj in pairs(ActiveObjects) do
+		if obj.Destroy then
+			obj:Destroy()
+		end
+	end
+	ActiveObjects = {}
+	RenderQueue = {}
+	DepthCheckCache = {}
+	for _, layer in pairs(RenderLayers) do
+		layer.Objects = {}
+	end
+	Drawing.clear()
+	DrawingImmediate.Clear()
+end
+
+Drawing3D.CleanupDestroyedObjects = function()
+	for id, obj in pairs(ActiveObjects) do
+		if obj.Part and not obj.Part.Parent then
+			obj:Destroy()
+		end
+	end
+end
+
+Drawing3D.EnableDebugDraw = function(enabled)
+	DebugSettings.ShowDebugInfo = enabled
+end
+
+Drawing3D.EnableDebugBoundingBoxes = function(enabled)
+	DebugSettings.ShowBoundingBoxes = enabled
+end
+
+Drawing3D.EnableDebugNormals = function(enabled)
+	DebugSettings.ShowNormals = enabled
+end
+
+Drawing3D.EnableDebugWireframes = function(enabled)
+	DebugSettings.ShowWireframes = enabled
+end
+
+Drawing3D.EnablePerformanceStats = function(enabled)
+	DebugSettings.ShowPerformanceStats = enabled
+end
+
+Drawing3D.DrawDebugPoint3D = function(position, label, config)
+	config = config or {}
+	config.Color = config.Color or Color3.new(1, 1, 0)
+	config.Radius = config.Radius or 2
+	config.RenderLayer = config.RenderLayer or "Debug"
+	
+	local point = Circle3D.New(position, config.Radius, Vector3.new(0, 1, 0), config)
+	
+	if label then
+		local text = Text3D.New(position + Vector3.new(0, config.Radius + 1, 0), label, {
+			Mode = config.Mode or "Immediate",
+			RenderLayer = "Debug",
+			Color = config.Color,
+			Size = DebugSettings.DebugTextSize,
+			Center = true
+		})
+		return {point, text}
+	end
+	
+	return point
+end
+
+Drawing3D.DrawDebugRay = function(origin, direction, distance, config)
+	config = config or {}
+	distance = distance or 100
+	
+	return Debug3D.DrawRaycast(origin, direction, distance, nil, config)
+end
+
+Drawing3D.DrawDebugFrustum = function(camera, distance, config)
+	config = config or {}
+	config.Distance = distance or 100
+	
+	return Debug3D.DrawFrustum(camera, config)
+end
+
+Drawing3D.DrawCoordinateSystem = function(position, size, config)
+	config = config or {}
+	config.RenderLayer = config.RenderLayer or "Debug"
+	
+	return Debug3D.DrawCoordinateSystem(position, size, config)
+end
+
+Drawing3D.SetDepthCheckIgnoreList = function(parts)
+	GlobalSettings.DepthCheckIgnoreList = parts
+	CreateRaycastParams()
+end
+
+Drawing3D.AddToDepthCheckIgnoreList = function(part)
+	table.insert(GlobalSettings.DepthCheckIgnoreList, part)
+	CreateRaycastParams()
+end
+
+Drawing3D.RemoveFromDepthCheckIgnoreList = function(part)
+	for i, p in pairs(GlobalSettings.DepthCheckIgnoreList) do
+		if p == part then
+			table.remove(GlobalSettings.DepthCheckIgnoreList, i)
+			break
+		end
+	end
+	CreateRaycastParams()
+end
+
+return Drawing3D
